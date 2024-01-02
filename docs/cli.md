@@ -20,6 +20,7 @@ These options are available on all commands.
 | `--dry-run` | boolean | If set, reports the activity that would happen without taking effect |
 | `--debug` | boolean | If set, sets log level to >=DEBUG |
 | `--trace` | boolean | If set, sets log level to >=TRACE |
+| `--gitea` | boolean | Enable compatibility with Gitea |
 
 ## Bootstrapping
 
@@ -206,6 +207,7 @@ Options:
                                          [default: "release-please-config.json"]
   --manifest-file       where can the manifest file be found in the project?
                                       [default: ".release-please-manifest.json"]
+  --gitea               enable compatibility with Gitea
 ```
 
 ### Create a manifest release [deprecated]
@@ -258,4 +260,6 @@ Options:
                                          [default: "release-please-config.json"]
   --manifest-file   where can the manifest file be found in the project?
                                       [default: ".release-please-manifest.json"]
+  --gitea           enable compatibility with Gitea
+                                      [boolean] [default: false]
 ```

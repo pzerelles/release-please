@@ -65,6 +65,7 @@ export interface GitHubOptions {
   repository: Repository;
   octokitAPIs: OctokitAPIs;
   logger?: Logger;
+  giteaAPI?: string;
 }
 
 interface ProxyOption {
@@ -82,6 +83,7 @@ interface GitHubCreateOptions {
   token?: string;
   logger?: Logger;
   proxy?: ProxyOption;
+  gitea?: boolean;
 }
 
 type CommitFilter = (commit: Commit) => boolean;
@@ -208,6 +210,7 @@ export class GitHub {
   private graphql: Function;
   private fileCache: RepositoryFileCache;
   private logger: Logger;
+  private giteaAPI?: string;
 
   private constructor(options: GitHubOptions) {
     this.repository = options.repository;
@@ -216,6 +219,7 @@ export class GitHub {
     this.graphql = options.octokitAPIs.graphql;
     this.fileCache = new RepositoryFileCache(this.octokit, this.repository);
     this.logger = options.logger ?? defaultLogger;
+    this.giteaAPI = options.giteaAPI;
   }
 
   static createDefaultAgent(baseUrl: string, defaultProxy?: ProxyOption) {
@@ -290,6 +294,7 @@ export class GitHub {
       },
       octokitAPIs: apis,
       logger: options.logger,
+      giteaAPI: options.gitea ? apiUrl : undefined,
     };
     return new GitHub(opts);
   }
@@ -365,11 +370,9 @@ export class GitHub {
     let cursor: string | undefined = undefined;
     let results = 0;
     while (results < maxResults) {
-      const response: CommitHistory | null = await this.mergeCommitsGraphQL(
-        targetBranch,
-        cursor,
-        options
-      );
+      const response: CommitHistory | null = await (this.giteaAPI
+        ? this.mergeCommits(targetBranch, cursor, options)
+        : this.mergeCommitsGraphQL(targetBranch, cursor, options));
       // no response usually means that the branch can't be found
       if (!response) {
         break;
@@ -384,6 +387,119 @@ export class GitHub {
       cursor = response.pageInfo.endCursor;
     }
   }
+
+  /**
+   * Get the list of commits
+   *
+   * @param {string} sha The commit SHA
+   * @returns {string[]} File paths
+   * @throws {GitHubAPIError} on an API error
+   */
+  private mergeCommits = wrapAsync(
+    async (
+      targetBranch: string,
+      cursor?: string,
+      options: CommitIteratorOptions = {}
+    ): Promise<CommitHistory | null> => {
+      this.logger.debug(
+        `Fetching merge commits on branch ${targetBranch} with cursor: ${cursor}`
+      );
+      const req = `/repos/${this.repository.owner}/${
+        this.repository.repo
+      }/commits?sha=${targetBranch}&limit=25${
+        cursor ? `&page=${parseInt(cursor)}` : ''
+      }`;
+      const res = await fetch(`${this.giteaAPI}/${req}`);
+      const commits = await res.json();
+      if (!res.ok || !commits) {
+        this.logger.warn(`Did not receive a response for ${req}`);
+        return null;
+      }
+
+      // Count the number of pull requests associated with each merge commit. This is
+      // used in the next step to make sure we only find pull requests with a
+      // merge commit that contain 1 merged commit.
+      const mergeCommitCount: Record<string, number> = {};
+      const mergeCommitPR: Record<string, any> = {};
+      const firstPR: Record<string, any> = {};
+      for await (const res of this.octokit.paginate.iterator(
+        'GET /repos/{owner}/{repo}/pulls',
+        {
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+        }
+      )) {
+        if (!res) {
+          this.logger.warn(
+            `Did not receive a response for /repos/${this.repository.owner}/${this.repository.repo}/pulls`
+          );
+          return null;
+        }
+
+        for (const pr of res.data) {
+          if (pr.merge_commit_sha) {
+            mergeCommitCount[pr.merge_commit_sha] ??= 0;
+            mergeCommitCount[pr.merge_commit_sha]++;
+            mergeCommitPR[pr.merge_commit_sha] = pr;
+            firstPR[pr.merge_commit_sha] ??= pr;
+          }
+        }
+      }
+
+      const commitData: Commit[] = [];
+      for (const co of commits) {
+        const commit: Commit = {
+          sha: co.sha,
+          message: co.commit.message,
+        };
+        const mergeCommits = mergeCommitCount[co.sha];
+        const mergePullRequest =
+          mergeCommits === 1 ? mergeCommitPR[co.sha] : undefined;
+        const pullRequest = mergePullRequest || firstPR[co.sha];
+        if (pullRequest) {
+          commit.pullRequest = {
+            sha: commit.sha,
+            number: pullRequest.number,
+            baseBranchName: pullRequest.baseRefName,
+            headBranchName: pullRequest.headRefName,
+            title: pullRequest.title,
+            body: pullRequest.body,
+            labels: pullRequest.labels,
+            files: [],
+          };
+        }
+        if (mergePullRequest) {
+          if (
+            mergePullRequest.files?.pageInfo?.hasNextPage &&
+            options.backfillFiles
+          ) {
+            this.logger.info(
+              `PR #${mergePullRequest.number} has many files, backfilling`
+            );
+            commit.files = await this.getCommitFiles(co.sha);
+          } else {
+            // We cannot directly fetch files on commits via graphql, only provide file
+            // information for commits with associated pull requests
+            commit.files = [];
+          }
+        } else if (options.backfillFiles) {
+          // In this case, there is no squashed merge commit. This could be a simple
+          // merge commit, a rebase merge commit, or a direct commit to the branch.
+          // Fallback to fetching the list of commits from the REST API. In the future
+          // we can perhaps lazy load these.
+          commit.files = await this.getCommitFiles(co.sha);
+        }
+        commitData.push(commit);
+      }
+      return {
+        pageInfo: {
+          hasNextPage: res.headers.get('x-hasmore') === 'true',
+          endCursor: (cursor ? parseInt(cursor) + 25 : 25).toString(),
+        },
+        data: commitData,
+      };
+    }
+  );
 
   private async mergeCommitsGraphQL(
     targetBranch: string,
@@ -557,20 +673,28 @@ export class GitHub {
   getCommitFiles = wrapAsync(async (sha: string): Promise<string[]> => {
     this.logger.debug(`Backfilling file list for commit: ${sha}`);
     const files: string[] = [];
-    for await (const resp of this.octokit.paginate.iterator(
-      'GET /repos/{owner}/{repo}/commits/{ref}',
-      {
-        owner: this.repository.owner,
-        repo: this.repository.repo,
-        ref: sha,
-      }
-    )) {
-      // Paginate plugin doesn't have types for listing files on a commit
-      const data = resp.data as any as {files: {filename: string}[]};
-      for (const f of data.files || []) {
-        if (f.filename) {
-          files.push(f.filename);
+    if (this.giteaAPI) {
+      const commits: {sha: string; files: {filename: string}[]}[] = await fetch(
+        `${this.giteaAPI}/repos/${this.repository.owner}/${this.repository.repo}/commits?sha=${sha}&limit=1`
+      ).then(res => res.json());
+      files.push(...(commits?.[0]?.files.map(({filename}) => filename) ?? []));
+    } else {
+      for await (const resp of this.octokit.paginate.iterator(
+        'GET /repos/{owner}/{repo}/commits/{ref}',
+        {
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+          ref: sha,
         }
+      )) {
+        // Paginate plugin doesn't have types for listing files on a commit
+        const data = resp.data as any as {files: {filename: string}[]};
+        for (const f of data.files || []) {
+          if (f.filename) {
+            files.push(f.filename);
+          }
+        }
+        break;
       }
     }
     if (files.length >= 3000) {
@@ -840,9 +964,14 @@ export class GitHub {
   async *releaseIterator(options: ReleaseIteratorOptions = {}) {
     const maxResults = options.maxResults ?? Number.MAX_SAFE_INTEGER;
     let results = 0;
+    if (this.giteaAPI) {
+      return;
+    }
     let cursor: string | undefined = undefined;
     while (true) {
-      const response: ReleaseHistory | null = await this.releaseGraphQL(cursor);
+      const response: ReleaseHistory | null = await (this.giteaAPI
+        ? this.releases(cursor)
+        : this.releaseGraphQL(cursor));
       if (!response) {
         break;
       }
@@ -857,6 +986,45 @@ export class GitHub {
       }
       cursor = response.pageInfo.endCursor;
     }
+  }
+
+  private async releases(cursor?: string): Promise<ReleaseHistory | null> {
+    this.logger.debug(`Fetching releases with cursor ${cursor}`);
+    const res = await this.request(
+      `GET /repos/{owner}/{repo}/releases?limit=25${
+        cursor ? `&page=${parseInt(cursor)}` : ''
+      }`,
+      {
+        owner: this.repository.owner,
+        repo: this.repository.repo,
+      }
+    );
+    if (!res.data.length) {
+      this.logger.warn('Could not find releases.');
+      return null;
+    }
+    const releases = res.data as Record<string, any>[];
+    return {
+      pageInfo: {
+        hasNextPage: res.headers['x-hasmore'] === 'true',
+        endCursor: (cursor ? parseInt(cursor) + 25 : 25).toString(),
+      },
+      data: releases
+        .filter(release => !!release.target_commitish)
+        .map(release => {
+          if (!release.tag_name || !release.target_commitish) {
+            this.logger.debug(release);
+          }
+          return {
+            name: release.name || undefined,
+            tagName: release.tag_name ? release.tag_name : 'unknown',
+            sha: release.target_commitish,
+            notes: release.body,
+            url: release.url,
+            draft: release.draft,
+          } as GitHubRelease;
+        }),
+    } as ReleaseHistory;
   }
 
   private async releaseGraphQL(
@@ -1147,6 +1315,166 @@ export class GitHub {
     ): Promise<PullRequest> => {
       //  Update the files for the release if not already supplied
       const changes = await this.buildChangeSet(updates, targetBranch);
+      if (this.giteaAPI) {
+        const branch = await this.request(
+          'GET /repos/{owner}/{repo}/branches/{branch}',
+          {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            branch: pullRequest.headBranchName,
+          }
+        ).catch(() => undefined);
+        const pr = branch
+          ? (
+              await this.request('GET /repos/{owner}/{repo}/pulls', {
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                state: 'open',
+              })
+            ).data.find(pr => pr.head.ref === pullRequest.headBranchName)
+          : undefined;
+
+        if (pr) {
+          this.logger.info(
+            `Found existing pull request for reference ${pullRequest.headBranchName}. Skipping creating a new pull request.`
+          );
+        } else {
+          this.logger.info(
+            `Creating PR branch ${pullRequest.headBranchName} from ${targetBranch}`
+          );
+        }
+
+        if (branch) {
+          await this.request('DELETE /repos/{owner}/{repo}/branches/{branch}', {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            branch: pullRequest.headBranchName,
+          });
+
+          if (pr) {
+            while (
+              pr &&
+              (
+                await this.request('GET /repos/{owner}/{repo}/pulls/{index}', {
+                  owner: this.repository.owner,
+                  repo: this.repository.repo,
+                  index: pr.number,
+                })
+              ).data.state !== 'closed'
+            ) {
+              this.logger.info('Waiting for PR to be closed...');
+              await new Promise<void>(resolve => {
+                setTimeout(() => {
+                  resolve();
+                }, 1000);
+              });
+            }
+          }
+        } else {
+          await new Promise<void>(resolve => {
+            setTimeout(() => {
+              resolve();
+            }, 5000);
+          });
+        }
+
+        const branchRes = await this.request(
+          'POST /repos/{owner}/{repo}/contents',
+          {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            files: [...changes.entries()].map(
+              ([path, {content, originalContent}]) => ({
+                content: content && Buffer.from(content).toString('base64'),
+                path,
+                operation: originalContent ? 'update' : 'create',
+              })
+            ),
+            branch: targetBranch,
+            new_branch: pullRequest.headBranchName,
+            message,
+          }
+        );
+        this.logger.info(
+          `Successfully created PR branch with the desired changes with SHA ${branchRes.data.commit.sha}`
+        );
+
+        const labels = (
+          await this.request('GET /repos/{owner}/{repo}/labels', {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+          })
+        ).data.reduce((r, {id, name}) => {
+          r[name] = id;
+          return r;
+        }, {} as Record<string, number>);
+
+        const newLabels = pullRequest.labels.filter(label => !labels[label]);
+        if (newLabels.length) {
+          for (const name of newLabels) {
+            const label = (
+              await this.request('POST /repos/{owner}/{repo}/labels', {
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                name,
+                color: '#52545e',
+              })
+            ).data;
+            labels[name] = label.id;
+          }
+        }
+
+        if (pr) {
+          await this.request('PATCH /repos/{owner}/{repo}/pulls/{index}', {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            index: pr.number,
+            title: pullRequest.title,
+            body: pullRequest.body,
+            state: 'open',
+          });
+
+          this.logger.info(`Successfully updated pull request: ${pr.number}.`);
+
+          return {
+            headBranchName: pr.head.ref,
+            baseBranchName: pr.base.ref,
+            number: pr.number,
+            title: pr.title,
+            body: pr.body || '',
+            files: [],
+            labels: pr.labels
+              .map(label => label.name)
+              .filter(name => !!name) as string[],
+          };
+        } else {
+          const res = await this.request('POST /repos/{owner}/{repo}/pulls', {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            head: pullRequest.headBranchName,
+            base: targetBranch,
+            title: pullRequest.title,
+            body: pullRequest.body,
+            labels: pullRequest.labels.map(label => labels[label]),
+          });
+
+          this.logger.info(
+            `Successfully opened pull request: ${res.data.number}.`
+          );
+
+          return {
+            headBranchName: res.data.head.ref,
+            baseBranchName: res.data.base.ref,
+            number: res.data.number,
+            title: res.data.title,
+            body: res.data.body || '',
+            files: [],
+            labels: res.data.labels
+              .map(label => label.name)
+              .filter(name => !!name) as string[],
+          };
+        }
+      }
       const prNumber = await createPullRequest(this.octokit, changes, {
         upstreamOwner: this.repository.owner,
         upstreamRepo: this.repository.repo,
@@ -1230,23 +1558,94 @@ export class GitHub {
       )
         .toString()
         .slice(0, MAX_ISSUE_BODY_SIZE);
-      const prNumber = await createPullRequest(this.octokit, changes, {
-        upstreamOwner: this.repository.owner,
-        upstreamRepo: this.repository.repo,
-        title,
-        branch: releasePullRequest.headRefName,
-        description: body,
-        primary: targetBranch,
-        force: true,
-        fork: options?.fork === false ? false : true,
-        message,
-        logger: this.logger,
-        draft: releasePullRequest.draft,
-      });
-      if (prNumber !== number) {
-        this.logger.warn(
-          `updated code for ${prNumber}, but update requested for ${number}`
+
+      if (this.giteaAPI) {
+        await this.request('DELETE /repos/{owner}/{repo}/branches/{branch}', {
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+          branch: releasePullRequest.headRefName,
+        });
+
+        while (
+          (
+            await this.request('GET /repos/{owner}/{repo}/pulls/{index}', {
+              owner: this.repository.owner,
+              repo: this.repository.repo,
+              index: number,
+            })
+          ).data.state !== 'closed'
+        ) {
+          this.logger.info('Waiting for PR to be closed...');
+          await new Promise<void>(resolve => {
+            setTimeout(() => {
+              resolve();
+            }, 1000);
+          });
+        }
+
+        const branchRes = await this.request(
+          'POST /repos/{owner}/{repo}/contents',
+          {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            files: [...changes.entries()].map(
+              ([path, {content, originalContent}]) => ({
+                content: content && Buffer.from(content).toString('base64'),
+                path,
+                operation: originalContent ? 'update' : 'create',
+              })
+            ),
+            branch: targetBranch,
+            new_branch: releasePullRequest.headRefName,
+            message,
+          }
         );
+        this.logger.info(
+          `Successfully created PR branch with the desired changes with SHA ${branchRes.data.commit.sha}`
+        );
+
+        const response = await this.request(
+          'PATCH /repos/{owner}/{repo}/pulls/{index}',
+          {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            index: number,
+            title,
+            body,
+            state: 'open',
+          }
+        );
+        this.logger.info(`Successfully updated pull request: ${number}.`);
+        return {
+          headBranchName: response.data.head.ref,
+          baseBranchName: response.data.base.ref,
+          number: response.data.number,
+          title: response.data.title,
+          body: response.data.body || '',
+          files: [],
+          labels: (response.data.labels as {name: string}[])
+            .map(label => label.name)
+            .filter(name => !!name) as string[],
+        };
+      } else {
+        const prNumber = await createPullRequest(this.octokit, changes, {
+          upstreamOwner: this.repository.owner,
+          upstreamRepo: this.repository.repo,
+          title,
+          branch: releasePullRequest.headRefName,
+          description: body,
+          primary: targetBranch,
+          force: true,
+          fork: options?.fork === false ? false : true,
+          message,
+          logger: this.logger,
+          draft: releasePullRequest.draft,
+        });
+        if (prNumber !== number) {
+          this.logger.warn(
+            `updated code for ${prNumber}, but update requested for ${number}`
+          );
+        }
       }
       const response = await this.octokit.pulls.update({
         owner: this.repository.owner,
@@ -1454,16 +1853,43 @@ export class GitHub {
         return;
       }
       this.logger.debug(`removing labels: ${labels} from issue/pull ${number}`);
-      await Promise.all(
-        labels.map(label =>
-          this.octokit.issues.removeLabel({
+      if (this.giteaAPI) {
+        const labelIds = (
+          await this.request('GET /repos/{owner}/{repo}/labels', {
             owner: this.repository.owner,
             repo: this.repository.repo,
-            issue_number: number,
-            name: label,
           })
-        )
-      );
+        ).data.reduce((r, {id, name}) => {
+          r[name] = id;
+          return r;
+        }, {} as Record<string, number>);
+        await Promise.all(
+          labels.map(label => {
+            const id = labelIds[label];
+            if (id === undefined) return undefined;
+            return this.request(
+              'DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{id}',
+              {
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                issue_number: number,
+                id,
+              }
+            );
+          })
+        );
+      } else {
+        await Promise.all(
+          labels.map(label =>
+            this.octokit.issues.removeLabel({
+              owner: this.repository.owner,
+              repo: this.repository.repo,
+              issue_number: number,
+              name: label,
+            })
+          )
+        );
+      }
     }
   );
 
@@ -1479,12 +1905,47 @@ export class GitHub {
         return;
       }
       this.logger.debug(`adding labels: ${labels} from issue/pull ${number}`);
-      await this.octokit.issues.addLabels({
-        owner: this.repository.owner,
-        repo: this.repository.repo,
-        issue_number: number,
-        labels,
-      });
+      if (this.giteaAPI) {
+        const labelIds = (
+          await this.request('GET /repos/{owner}/{repo}/labels', {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+          })
+        ).data.reduce((r, {id, name}) => {
+          r[name] = id;
+          return r;
+        }, {} as Record<string, number>);
+        const newLabels = labels.filter(label => !labelIds[label]);
+        if (newLabels.length) {
+          for (const name of newLabels) {
+            const label = (
+              await this.request('POST /repos/{owner}/{repo}/labels', {
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                name,
+                color: '#52545e',
+              })
+            ).data;
+            labelIds[name] = label.id;
+          }
+        }
+        await this.request(
+          'POST /repos/{owner}/{repo}/issues/{issue_number}/labels',
+          {
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            issue_number: number,
+            labels: labels.map(label => labelIds[label]) as unknown as string[],
+          }
+        );
+      } else {
+        await this.octokit.issues.addLabels({
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+          issue_number: number,
+          labels,
+        });
+      }
     }
   );
 

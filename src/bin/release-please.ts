@@ -49,6 +49,7 @@ interface GitHubArgs {
   apiUrl?: string;
   graphqlUrl?: string;
   fork?: boolean;
+  gitea?: boolean;
 
   // deprecated in favor of targetBranch
   defaultBranch?: string;
@@ -182,6 +183,11 @@ function gitHubOptions(yargs: yargs.Argv): yargs.Argv {
     })
     .option('dry-run', {
       describe: 'Prepare but do not take action',
+      type: 'boolean',
+      default: false,
+    })
+    .option('gitea', {
+      describe: 'Enable compatibility with Gitea',
       type: 'boolean',
       default: false,
     })
@@ -805,6 +811,7 @@ async function buildGitHub(argv: GitHubArgs): Promise<GitHub> {
     token: argv.token!,
     apiUrl: argv.apiUrl,
     graphqlUrl: argv.graphqlUrl,
+    gitea: argv.gitea,
   });
   return github;
 }

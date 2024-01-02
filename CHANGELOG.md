@@ -4,6 +4,22 @@
 
 [1]: https://www.npmjs.com/package/release-please?activeTab=versions
 
+## [16.7.0](https://github.com/pzerelles/release-please/compare/v16.6.0...v16.7.0) (2024-01-11)
+
+
+### Features
+
+* add pull request creation for Gitea ([0aa2a91](https://github.com/pzerelles/release-please/commit/0aa2a91e432466bf6b24c8e4943752d8cb5567f8))
+* implement API version of mergeCommits ([9ff6b5f](https://github.com/pzerelles/release-please/commit/9ff6b5fb90141047bb5a18b01c9a1738d6f895ba))
+
+
+### Bug Fixes
+
+* delete and recreate branch to update PR ([bdf9911](https://github.com/pzerelles/release-please/commit/bdf99114744227ed8f81d3e6eccd8083cd451a77))
+* update PR ([addf0ac](https://github.com/pzerelles/release-please/commit/addf0acfca0440aa453b5cb1d36b16ed212cd8b2))
+* use rebase and commit instead of temporary branch to re-use PR branch ([89b3385](https://github.com/pzerelles/release-please/commit/89b3385f09fee85c29ab087593fe8499b443c0d0))
+* use temporary branch to re-use PR branch ([aaf513e](https://github.com/pzerelles/release-please/commit/aaf513e78be96be9c8cd3dec28292f9ee3917fdf))
+
 ## [16.6.0](https://github.com/googleapis/release-please/compare/v16.5.1...v16.6.0) (2023-12-28)
 
 
