@@ -65,7 +65,7 @@ export interface GitHubOptions {
   repository: Repository;
   octokitAPIs: OctokitAPIs;
   logger?: Logger;
-  gitea?: boolean;
+  giteaAPI?: string;
 }
 
 interface ProxyOption {
@@ -210,7 +210,7 @@ export class GitHub {
   private graphql: Function;
   private fileCache: RepositoryFileCache;
   private logger: Logger;
-  private gitea: boolean;
+  private giteaAPI?: string;
 
   private constructor(options: GitHubOptions) {
     this.repository = options.repository;
@@ -219,7 +219,7 @@ export class GitHub {
     this.graphql = options.octokitAPIs.graphql;
     this.fileCache = new RepositoryFileCache(this.octokit, this.repository);
     this.logger = options.logger ?? defaultLogger;
-    this.gitea = options.gitea ?? false;
+    this.giteaAPI = options.giteaAPI;
   }
 
   static createDefaultAgent(baseUrl: string, defaultProxy?: ProxyOption) {
@@ -294,7 +294,7 @@ export class GitHub {
       },
       octokitAPIs: apis,
       logger: options.logger,
-      gitea: options.gitea,
+      giteaAPI: options.gitea ? apiUrl : undefined,
     };
     return new GitHub(opts);
   }
@@ -370,9 +370,9 @@ export class GitHub {
     let cursor: string | undefined = undefined;
     let results = 0;
     while (results < maxResults) {
-      const response: CommitHistory | null = await (this.gitea
-        ? this.mergeCommits
-        : this.mergeCommitsGraphQL)(targetBranch, cursor, options);
+      const response: CommitHistory | null = await (this.giteaAPI
+        ? this.mergeCommits(targetBranch, cursor, options)
+        : this.mergeCommitsGraphQL(targetBranch, cursor, options));
       // no response usually means that the branch can't be found
       if (!response) {
         break;
@@ -404,32 +404,100 @@ export class GitHub {
       this.logger.debug(
         `Fetching merge commits on branch ${targetBranch} with cursor: ${cursor}`
       );
-      const params = {
-        sha: targetBranch,
-        per_page: 25,
-        page: cursor ? parseInt(cursor) : 1,
-      };
-      for await (const response of this.octokit.paginate.iterator(
-        'GET /repos/{owner}/{repo}/commits',
+      const req = `/repos/${this.repository.owner}/${
+        this.repository.repo
+      }/commits?sha=${targetBranch}&limit=25${
+        cursor ? `&page=${parseInt(cursor)}` : ''
+      }`;
+      const res = await fetch(`${this.giteaAPI}/${req}`);
+      const commits = await res.json();
+      if (!res.ok || !commits) {
+        this.logger.warn(`Did not receive a response for ${req}`);
+        return null;
+      }
+
+      // Count the number of pull requests associated with each merge commit. This is
+      // used in the next step to make sure we only find pull requests with a
+      // merge commit that contain 1 merged commit.
+      const mergeCommitCount: Record<string, number> = {};
+      const mergeCommitPR: Record<string, any> = {};
+      const firstPR: Record<string, any> = {};
+      for await (const res of this.octokit.paginate.iterator(
+        'GET /repos/{owner}/{repo}/pulls',
         {
           owner: this.repository.owner,
           repo: this.repository.repo,
-          ...params,
         }
       )) {
-        if (!response) {
+        if (!res) {
           this.logger.warn(
-            `Did not receive a response for /repos/${this.repository.owner}/${this.repository.repo}/commits`,
-            params
+            `Did not receive a response for /repos/${this.repository.owner}/${this.repository.repo}/pulls`
           );
           return null;
         }
 
-        // Paginate plugin doesn't have types for listing files on a commit
-        console.log(response);
-        break;
+        for (const pr of res.data) {
+          if (pr.merge_commit_sha) {
+            mergeCommitCount[pr.merge_commit_sha] ??= 0;
+            mergeCommitCount[pr.merge_commit_sha]++;
+            mergeCommitPR[pr.merge_commit_sha] = pr;
+            firstPR[pr.merge_commit_sha] ??= pr;
+          }
+        }
       }
-      return null;
+
+      const commitData: Commit[] = [];
+      for (const co of commits) {
+        const commit: Commit = {
+          sha: co.sha,
+          message: co.commit.message,
+        };
+        const mergeCommits = mergeCommitCount[co.sha];
+        const mergePullRequest =
+          mergeCommits === 1 ? mergeCommitPR[co.sha] : undefined;
+        const pullRequest = mergePullRequest || firstPR[co.sha];
+        if (pullRequest) {
+          commit.pullRequest = {
+            sha: commit.sha,
+            number: pullRequest.number,
+            baseBranchName: pullRequest.baseRefName,
+            headBranchName: pullRequest.headRefName,
+            title: pullRequest.title,
+            body: pullRequest.body,
+            labels: pullRequest.labels,
+            files: [],
+          };
+        }
+        if (mergePullRequest) {
+          if (
+            mergePullRequest.files?.pageInfo?.hasNextPage &&
+            options.backfillFiles
+          ) {
+            this.logger.info(
+              `PR #${mergePullRequest.number} has many files, backfilling`
+            );
+            commit.files = await this.getCommitFiles(co.sha);
+          } else {
+            // We cannot directly fetch files on commits via graphql, only provide file
+            // information for commits with associated pull requests
+            commit.files = [];
+          }
+        } else if (options.backfillFiles) {
+          // In this case, there is no squashed merge commit. This could be a simple
+          // merge commit, a rebase merge commit, or a direct commit to the branch.
+          // Fallback to fetching the list of commits from the REST API. In the future
+          // we can perhaps lazy load these.
+          commit.files = await this.getCommitFiles(co.sha);
+        }
+        commitData.push(commit);
+      }
+      return {
+        pageInfo: {
+          hasNextPage: res.headers.get('x-hasmore') === 'true',
+          endCursor: (cursor ? parseInt(cursor) + 25 : 25).toString(),
+        },
+        data: commitData,
+      };
     }
   );
 
@@ -605,20 +673,29 @@ export class GitHub {
   getCommitFiles = wrapAsync(async (sha: string): Promise<string[]> => {
     this.logger.debug(`Backfilling file list for commit: ${sha}`);
     const files: string[] = [];
-    for await (const resp of this.octokit.paginate.iterator(
-      'GET /repos/{owner}/{repo}/commits/{ref}',
-      {
-        owner: this.repository.owner,
-        repo: this.repository.repo,
-        ref: sha,
-      }
-    )) {
-      // Paginate plugin doesn't have types for listing files on a commit
-      const data = resp.data as any as {files: {filename: string}[]};
-      for (const f of data.files || []) {
-        if (f.filename) {
-          files.push(f.filename);
+    if (this.giteaAPI) {
+      const commits: {sha: string; files: {filename: string}[]}[] = await fetch(
+        `${this.giteaAPI}/repos/${this.repository.owner}/${this.repository.repo}/commits?sha=${sha}&limit=1`
+      ).then(res => res.json());
+      files.push(...(commits?.[0]?.files.map(({filename}) => filename) ?? []));
+    } else {
+      for await (const resp of this.octokit.paginate.iterator(
+        'GET /repos/{owner}/{repo}/commits/{ref}',
+        {
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+          ref: sha,
         }
+      )) {
+        // Paginate plugin doesn't have types for listing files on a commit
+        const data = resp.data as any as {files: {filename: string}[]};
+        console.log(data);
+        for (const f of data.files || []) {
+          if (f.filename) {
+            files.push(f.filename);
+          }
+        }
+        break;
       }
     }
     if (files.length >= 3000) {
@@ -888,7 +965,7 @@ export class GitHub {
   async *releaseIterator(options: ReleaseIteratorOptions = {}) {
     const maxResults = options.maxResults ?? Number.MAX_SAFE_INTEGER;
     let results = 0;
-    if (this.gitea) {
+    if (this.giteaAPI) {
       return;
     }
     let cursor: string | undefined = undefined;
