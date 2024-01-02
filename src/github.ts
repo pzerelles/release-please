@@ -65,6 +65,7 @@ export interface GitHubOptions {
   repository: Repository;
   octokitAPIs: OctokitAPIs;
   logger?: Logger;
+  gitea?: boolean;
 }
 
 interface ProxyOption {
@@ -82,6 +83,7 @@ interface GitHubCreateOptions {
   token?: string;
   logger?: Logger;
   proxy?: ProxyOption;
+  gitea?: boolean;
 }
 
 type CommitFilter = (commit: Commit) => boolean;
@@ -208,6 +210,7 @@ export class GitHub {
   private graphql: Function;
   private fileCache: RepositoryFileCache;
   private logger: Logger;
+  private gitea: boolean;
 
   private constructor(options: GitHubOptions) {
     this.repository = options.repository;
@@ -216,6 +219,7 @@ export class GitHub {
     this.graphql = options.octokitAPIs.graphql;
     this.fileCache = new RepositoryFileCache(this.octokit, this.repository);
     this.logger = options.logger ?? defaultLogger;
+    this.gitea = options.gitea ?? false;
   }
 
   static createDefaultAgent(baseUrl: string, defaultProxy?: ProxyOption) {
@@ -290,6 +294,7 @@ export class GitHub {
       },
       octokitAPIs: apis,
       logger: options.logger,
+      gitea: options.gitea,
     };
     return new GitHub(opts);
   }
@@ -365,11 +370,9 @@ export class GitHub {
     let cursor: string | undefined = undefined;
     let results = 0;
     while (results < maxResults) {
-      const response: CommitHistory | null = await this.mergeCommitsGraphQL(
-        targetBranch,
-        cursor,
-        options
-      );
+      const response: CommitHistory | null = await (this.gitea
+        ? this.mergeCommits
+        : this.mergeCommitsGraphQL)(targetBranch, cursor, options);
       // no response usually means that the branch can't be found
       if (!response) {
         break;
@@ -384,6 +387,51 @@ export class GitHub {
       cursor = response.pageInfo.endCursor;
     }
   }
+
+  /**
+   * Get the list of commits
+   *
+   * @param {string} sha The commit SHA
+   * @returns {string[]} File paths
+   * @throws {GitHubAPIError} on an API error
+   */
+  private mergeCommits = wrapAsync(
+    async (
+      targetBranch: string,
+      cursor?: string,
+      options: CommitIteratorOptions = {}
+    ): Promise<CommitHistory | null> => {
+      this.logger.debug(
+        `Fetching merge commits on branch ${targetBranch} with cursor: ${cursor}`
+      );
+      const params = {
+        sha: targetBranch,
+        per_page: 25,
+        page: cursor ? parseInt(cursor) : 1,
+      };
+      for await (const response of this.octokit.paginate.iterator(
+        'GET /repos/{owner}/{repo}/commits',
+        {
+          owner: this.repository.owner,
+          repo: this.repository.repo,
+          ...params,
+        }
+      )) {
+        if (!response) {
+          this.logger.warn(
+            `Did not receive a response for /repos/${this.repository.owner}/${this.repository.repo}/commits`,
+            params
+          );
+          return null;
+        }
+
+        // Paginate plugin doesn't have types for listing files on a commit
+        console.log(response);
+        break;
+      }
+      return null;
+    }
+  );
 
   private async mergeCommitsGraphQL(
     targetBranch: string,
@@ -840,6 +888,9 @@ export class GitHub {
   async *releaseIterator(options: ReleaseIteratorOptions = {}) {
     const maxResults = options.maxResults ?? Number.MAX_SAFE_INTEGER;
     let results = 0;
+    if (this.gitea) {
+      return;
+    }
     let cursor: string | undefined = undefined;
     while (true) {
       const response: ReleaseHistory | null = await this.releaseGraphQL(cursor);

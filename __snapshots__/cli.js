@@ -65,6 +65,7 @@ Options:
   --snapshot-label              set a java snapshot pull request label other
                                 than "autorelease: snapshot"
                                      [string] [default: "autorelease: snapshot"]
+  --gitea                       enable compatibility with Gitea
 `
 
 exports['CLI --help manifest-pr 1'] = `
