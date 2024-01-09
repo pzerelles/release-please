@@ -4,6 +4,13 @@
 
 [1]: https://www.npmjs.com/package/release-please?activeTab=versions
 
+## [16.7.0](https://github.com/pzerelles/release-please/compare/v16.6.0...v16.7.0) (2024-01-09)
+
+
+### Features
+
+* implement API version of mergeCommits ([9ff6b5f](https://github.com/pzerelles/release-please/commit/9ff6b5fb90141047bb5a18b01c9a1738d6f895ba))
+
 ## [16.6.0](https://github.com/googleapis/release-please/compare/v16.5.1...v16.6.0) (2023-12-28)
 
 
